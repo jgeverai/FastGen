@@ -177,13 +177,23 @@ class LADDEditingModel(LADDModel):
         Returns:
             Tuple of (loss_map, outputs)
         """
+        # Verify student network is in training mode with gradients enabled
+        assert self.net.training, "Student network should be in training mode"
+        net_params = list(self.net.parameters())
+        assert len(net_params) > 0, "Student network has no parameters"
+        assert net_params[0].requires_grad, "Student network parameters should require grad"
+
         # Generate edited data from student
         gen_data = self.gen_data_from_net(input_student, t_student, condition=condition)
+
+        # Verify generated data has gradients (through student network)
+        assert gen_data.requires_grad, \
+            f"gen_data requires_grad={gen_data.requires_grad}, grad_fn={gen_data.grad_fn}"
 
         # Perturb generated data for discriminator
         perturbed_data = self.net.noise_scheduler.forward_process(gen_data, eps, t)
 
-        # Extract features from teacher network
+        # Extract features from teacher network (no_grad for teacher, but we need grad through gen_data)
         fake_feat = self.teacher(
             perturbed_data,
             t,
@@ -192,8 +202,18 @@ class LADDEditingModel(LADDModel):
             feature_indices=self.discriminator.feature_indices,
         )
 
+        # Verify features are lists with expected number of elements
+        assert isinstance(fake_feat, list), f"fake_feat should be list, got {type(fake_feat)}"
+        assert len(fake_feat) == len(self.discriminator.feature_indices), \
+            f"fake_feat length {len(fake_feat)} != feature_indices {len(self.discriminator.feature_indices)}"
+
         # Compute GAN loss for generator
-        gan_loss_gen = gan_loss_generator(self.discriminator(fake_feat))
+        fake_feat_logit = self.discriminator(fake_feat)
+        gan_loss_gen = gan_loss_generator(fake_feat_logit)
+
+        # Verify loss has gradients
+        assert gan_loss_gen.requires_grad, \
+            f"gan_loss_gen requires_grad={gan_loss_gen.requires_grad}, grad_fn={gan_loss_gen.grad_fn}"
 
         # Build output dictionaries
         loss_map = {
@@ -234,6 +254,15 @@ class LADDEditingModel(LADDModel):
         Returns:
             Tuple of (loss_map, outputs)
         """
+        # Verify discriminator is in training mode with gradients enabled
+        assert self.discriminator.training, "Discriminator should be in training mode"
+        disc_params = list(self.discriminator.parameters())
+        assert len(disc_params) > 0, "Discriminator has no parameters"
+        assert disc_params[0].requires_grad, "Discriminator parameters should require grad"
+        # Verify device consistency
+        assert disc_params[0].device == target_data.device, \
+            f"Discriminator device {disc_params[0].device} != data device {target_data.device}"
+
         with torch.no_grad():
             # Generate edited data from student
             gen_data = self.gen_data_from_net(input_student, t_student, condition=condition)
@@ -253,9 +282,27 @@ class LADDEditingModel(LADDModel):
                 real_data=target_data, t=t, eps=eps, condition=condition
             )
 
+        # Verify features are lists with expected number of elements
+        assert isinstance(real_feat, list), f"real_feat should be list, got {type(real_feat)}"
+        assert isinstance(fake_feat, list), f"fake_feat should be list, got {type(fake_feat)}"
+        assert len(real_feat) == len(self.discriminator.feature_indices), \
+            f"real_feat length {len(real_feat)} != feature_indices {len(self.discriminator.feature_indices)}"
+
         # Compute discriminator loss
         real_feat_logit = self.discriminator(real_feat)
-        gan_loss_disc = gan_loss_discriminator(real_feat_logit, self.discriminator(fake_feat))
+        fake_feat_logit = self.discriminator(fake_feat)
+
+        # Verify discriminator outputs have gradients
+        assert real_feat_logit.requires_grad, \
+            f"real_feat_logit requires_grad={real_feat_logit.requires_grad}, grad_fn={real_feat_logit.grad_fn}"
+        assert fake_feat_logit.requires_grad, \
+            f"fake_feat_logit requires_grad={fake_feat_logit.requires_grad}, grad_fn={fake_feat_logit.grad_fn}"
+
+        gan_loss_disc = gan_loss_discriminator(real_feat_logit, fake_feat_logit)
+
+        # Verify GAN loss has gradients
+        assert gan_loss_disc.requires_grad, \
+            f"gan_loss_disc requires_grad={gan_loss_disc.requires_grad}, grad_fn={gan_loss_disc.grad_fn}"
 
         # R1 regularization (optional)
         gan_loss_ar1 = torch.zeros_like(gan_loss_disc)
@@ -263,8 +310,16 @@ class LADDEditingModel(LADDModel):
             gan_loss_ar1 = self._compute_r1_regularization(
                 real_feat_logit, target_data, t_real, condition=condition
             )
+            # Verify R1 loss has gradients
+            assert gan_loss_ar1.requires_grad, \
+                f"gan_loss_ar1 requires_grad={gan_loss_ar1.requires_grad}, grad_fn={gan_loss_ar1.grad_fn}"
 
         total_loss = gan_loss_disc + self.config.gan_r1_reg_weight * gan_loss_ar1
+
+        # Verify total loss has gradients
+        assert total_loss.requires_grad, \
+            f"total_loss requires_grad={total_loss.requires_grad}, grad_fn={total_loss.grad_fn}"
+
         loss_map = {
             "gan_loss_disc": gan_loss_disc,
             "total_loss": total_loss,
@@ -385,8 +440,8 @@ class LADDEditingModel(LADDModel):
             Generated edited image latents
         """
         if self.config.student_sample_steps == 1:
-            # Single-step generation
-            with self.precision_amp:
+            # Single-step generation with autocast
+            with self.autocast():
                 pred = self.net(x_t, t, condition=condition, fwd_pred_type="x0")
             return pred
         else:
