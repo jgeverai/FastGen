@@ -37,10 +37,10 @@ def create_config():
     config.model.precision = "bfloat16"
 
     # ===== Input Shape =====
-    # Flux2-Klein: 128 latent channels, no 2x2 packing
-    # For 1024x1024 images: latent is [128, 128, 128]
-    # For 512x512 images: latent is [128, 64, 64]
-    config.model.input_shape = [128, 128, 128]  # [C, H, W] for 1024x1024
+    # Flux2-Klein: VAE outputs 32 channels, then 2x2 patchified to 128 channels
+    # For 1024x1024 images: VAE [32, 128, 128] -> patchify [128, 64, 64]
+    # For 512x512 images: VAE [32, 64, 64] -> patchify [128, 32, 32]
+    config.model.input_shape = [128, 64, 64]  # [C, H, W] for 1024x1024 after patchify
 
     # ===== Discriminator Configuration =====
     config.model.discriminator = Discriminator_Flux2Klein_Config
@@ -85,7 +85,8 @@ def create_config():
 def create_config_512():
     """Create config for 512x512 resolution (lower memory)."""
     config = create_config()
-    config.model.input_shape = [128, 64, 64]  # [C, H, W] for 512x512
+    # 512x512: VAE [32, 64, 64] -> patchify [128, 32, 32]
+    config.model.input_shape = [128, 32, 32]
     config.dataloader_train.input_res = 512
     config.dataloader_train.batch_size = 4  # Can fit more at lower res
     config.log_config.group = "flux2klein_ladd_editing_512"
@@ -95,7 +96,8 @@ def create_config_512():
 def create_config_768():
     """Create config for 768x768 resolution."""
     config = create_config()
-    config.model.input_shape = [128, 96, 96]  # [C, H, W] for 768x768
+    # 768x768: VAE [32, 96, 96] -> patchify [128, 48, 48]
+    config.model.input_shape = [128, 48, 48]
     config.dataloader_train.input_res = 768
     config.dataloader_train.batch_size = 2
     config.log_config.group = "flux2klein_ladd_editing_768"

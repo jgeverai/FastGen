@@ -142,7 +142,10 @@ class Flux2KleinTextEncoder:
 class Flux2KleinImageEncoder:
     """VAE encoder/decoder for Flux2-Klein.
 
-    Flux2-Klein uses AutoencoderKLFlux2 with 128 latent channels.
+    Flux2-Klein uses AutoencoderKLFlux2 with 32 VAE latent channels.
+    After encoding, latents are patchified (2x2) to 128 channels for the transformer:
+    - VAE output: [B, 32, H, W]
+    - After patchify: [B, 128, H/2, W/2]
     """
 
     def __init__(self, model_id: str):
@@ -158,31 +161,69 @@ class Flux2KleinImageEncoder:
         self.scaling_factor = getattr(self.vae.config, "scaling_factor", 0.3611)
         self.shift_factor = getattr(self.vae.config, "shift_factor", 0.1159)
 
-    def encode(self, real_images: torch.Tensor) -> torch.Tensor:
-        """Encode images to latent space.
+    @staticmethod
+    def _patchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Patchify latents: pack 2x2 spatial patches into channels.
 
         Args:
-            real_images: Input images in [-1, 1] range.
+            latents: [B, C, H, W] where C=32 (VAE channels)
 
         Returns:
-            torch.Tensor: Latent representations (shifted and scaled).
+            [B, C*4, H/2, W/2] where C*4=128 (transformer channels)
         """
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.view(batch_size, num_channels, height // 2, 2, width // 2, 2)
+        latents = latents.permute(0, 1, 3, 5, 2, 4)
+        latents = latents.reshape(batch_size, num_channels * 4, height // 2, width // 2)
+        return latents
+
+    @staticmethod
+    def _unpatchify_latents(latents: torch.Tensor) -> torch.Tensor:
+        """Unpatchify latents: unpack channels back to 2x2 spatial patches.
+
+        Args:
+            latents: [B, C, H, W] where C=128 (transformer channels)
+
+        Returns:
+            [B, C/4, H*2, W*2] where C/4=32 (VAE channels)
+        """
+        batch_size, num_channels, height, width = latents.shape
+        latents = latents.reshape(batch_size, num_channels // 4, 2, 2, height, width)
+        latents = latents.permute(0, 1, 4, 2, 5, 3)
+        latents = latents.reshape(batch_size, num_channels // 4, height * 2, width * 2)
+        return latents
+
+    def encode(self, real_images: torch.Tensor) -> torch.Tensor:
+        """Encode images to latent space and patchify for transformer.
+
+        Args:
+            real_images: Input images in [-1, 1] range, shape [B, 3, H, W].
+
+        Returns:
+            torch.Tensor: Patchified latents [B, 128, H/16, W/16] for 1024x1024 input.
+        """
+        # VAE encode: [B, 3, H, W] -> [B, 32, H/8, W/8]
         latent_images = self.vae.encode(real_images, return_dict=False)[0].sample()
         # Apply shift and scale
         latent_images = (latent_images - self.shift_factor) * self.scaling_factor
+        # Patchify: [B, 32, H/8, W/8] -> [B, 128, H/16, W/16]
+        latent_images = self._patchify_latents(latent_images)
         return latent_images
 
     def decode(self, latent_images: torch.Tensor) -> torch.Tensor:
-        """Decode latents to images.
+        """Decode patchified latents to images.
 
         Args:
-            latent_images: Latent representations (shifted and scaled).
+            latent_images: Patchified latent representations [B, 128, H/16, W/16].
 
         Returns:
             torch.Tensor: Decoded images in [-1, 1] range.
         """
+        # Unpatchify: [B, 128, H/16, W/16] -> [B, 32, H/8, W/8]
+        latents = self._unpatchify_latents(latent_images)
         # Reverse shift and scale
-        latents = (latent_images / self.scaling_factor) + self.shift_factor
+        latents = (latents / self.scaling_factor) + self.shift_factor
+        # VAE decode: [B, 32, H/8, W/8] -> [B, 3, H, W]
         images = self.vae.decode(latents, return_dict=False)[0].clip(-1.0, 1.0)
         return images
 
