@@ -428,30 +428,22 @@ class LADDEditingModel(LADDModel):
     ) -> torch.Tensor:
         """Generate edited data from the student network.
 
-        For single-step: directly predict the edited image from noisy source.
-        For multi-step: iteratively denoise to produce the edited image.
+        During training, this does a SINGLE forward pass to predict x0 from x_t.
+        This preserves gradients through the student network for backpropagation.
+
+        Note: Multi-step sampling (generator_fn) is only used for inference/visualization,
+        not during training, because it uses inference_mode which disables gradients.
 
         Args:
-            x_t: Input (noisy source image)
+            x_t: Input (noisy source image at timestep t)
             t: Timestep
             condition: Text conditioning
 
         Returns:
-            Generated edited image latents
+            Generated edited image latents (x0 prediction)
         """
-        if self.config.student_sample_steps == 1:
-            # Single-step generation with autocast
-            with self.autocast():
-                pred = self.net(x_t, t, condition=condition, fwd_pred_type="x0")
-            return pred
-        else:
-            # Multi-step generation
-            return self.generator_fn(
-                net=self.net,
-                noise=x_t,  # Start from noisy source
-                condition=condition,
-                student_sample_steps=self.config.student_sample_steps,
-                student_sample_type=self.config.student_sample_type,
-                t_list=self.config.sample_t_cfg.t_list,
-                precision_amp=self.precision_amp,
-            )
+        # Single forward pass - predicts x0 from noisy input at timestep t
+        # This preserves gradients through the student network
+        with self.autocast():
+            pred = self.net(x_t, t, condition=condition, fwd_pred_type="x0")
+        return pred
