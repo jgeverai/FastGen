@@ -1,9 +1,42 @@
+[project]
+name = "fastgen"
+version = "0.1.0"
+description = "diffusers-based inference server API for FLUX.2 [klein] 4B"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "diffusers",
+]
+
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
 
 [tool.ruff]
 line-length = 120
 
 [tool.ruff.lint]
 exclude = []
+
+[tool.uv.sources]
+diffusers = { git = "https://github.com/huggingface/diffusers.git", rev = "8abcf351c99ee6e6a4b7f405a2cf489851e36672" }
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cpu", marker = "sys_platform != 'linux'" },
+  { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
