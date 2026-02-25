@@ -26,9 +26,9 @@ import torch.utils.checkpoint
 from torch import dtype
 from torch.distributed.fsdp import fully_shard
 
-from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL
-from diffusers.models import Flux2Transformer2DModel
-from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from diffusers import FlowMatchEulerDiscreteScheduler
+from diffusers.models import Flux2Transformer2DModel, AutoencoderKLFlux2
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from fastgen.networks.network import FastGenNetwork
 from fastgen.networks.noise_schedule import NET_PRED_TYPES
@@ -38,38 +38,42 @@ import fastgen.utils.logging_utils as logger
 
 
 class Flux2KleinTextEncoder:
-    """Text encoder for Flux2-Klein using CLIP and T5 models."""
+    """Text encoder for Flux2-Klein using diffusers pipeline.
+
+    Flux2-Klein uses Qwen3ForCausalLM with a specific encoding strategy:
+    - Chat template formatting
+    - Multi-layer hidden state extraction (layers 9, 18, 27)
+    - Stacked embeddings
+
+    We leverage diffusers' Flux2KleinPipeline for correct encoding.
+
+    Note: Unlike CLIP+T5 based Flux.1, Flux2-Klein doesn't have native pooled
+    embeddings. We create a mean-pooled representation for compatibility with
+    the transformer's CombinedTimestepTextProjEmbeddings layer.
+    """
 
     def __init__(self, model_id: str):
-        # CLIP text encoder
-        self.tokenizer = CLIPTokenizer.from_pretrained(
+        from diffusers import Flux2KleinPipeline
+
+        # Load the full pipeline to get correct encoding
+        self._pipeline = Flux2KleinPipeline.from_pretrained(
             model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="tokenizer",
+            cache_dir=os.environ.get("HF_HOME"),
+            torch_dtype=torch.bfloat16,
             local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
         )
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="text_encoder",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
+
+        # Extract components we need
+        self.tokenizer = self._pipeline.tokenizer
+        self.text_encoder = self._pipeline.text_encoder
         self.text_encoder.eval().requires_grad_(False)
 
-        # T5 text encoder
-        self.tokenizer_2 = T5TokenizerFast.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="tokenizer_2",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder_2 = T5EncoderModel.from_pretrained(
-            model_id,
-            cache_dir=os.environ["HF_HOME"],
-            subfolder="text_encoder_2",
-            local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
-        )
-        self.text_encoder_2.eval().requires_grad_(False)
+        # Store reference to pipeline's encoding method
+        self._encode_prompt = self._pipeline._get_qwen3_prompt_embeds
+
+        # Get the expected pooled projection dimension from the transformer config
+        # Flux2-Klein uses 3072 for time_text_embed (24 heads * 128 dim)
+        self._pooled_projection_dim = 3072
 
     def encode(
         self,
@@ -82,66 +86,69 @@ class Flux2KleinTextEncoder:
         Args:
             conditioning: Text prompt(s) to encode.
             precision: Data type for the output embeddings.
-            max_sequence_length: Maximum sequence length for T5 tokenization.
+            max_sequence_length: Maximum sequence length for tokenization.
 
         Returns:
-            Tuple of (pooled_prompt_embeds, prompt_embeds) tensors.
+            Tuple of (pooled_prompt_embeds, prompt_embeds) for API compatibility.
+            pooled_prompt_embeds: Mean-pooled text embeddings projected to pooled_dim.
+            prompt_embeds: Full sequence text embeddings.
         """
         if isinstance(conditioning, str):
             conditioning = [conditioning]
 
-        # CLIP encoding for pooled embeddings
-        text_inputs = self.tokenizer(
-            conditioning,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-
         with torch.no_grad():
-            text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
-            prompt_embeds = self.text_encoder(
-                text_input_ids,
-                output_hidden_states=False,
+            # Use diffusers' encoding method which handles:
+            # - Chat template formatting
+            # - Multi-layer extraction (layers 9, 18, 27)
+            # - Proper stacking of hidden states
+            prompt_embeds = self._encode_prompt(
+                prompt=conditioning,
+                text_encoder=self.text_encoder,
+                tokenizer=self.tokenizer,
+                max_sequence_length=max_sequence_length,
+                device=self.text_encoder.device,
             )
-            pooled_prompt_embeds = prompt_embeds.pooler_output.to(precision)
+            prompt_embeds = prompt_embeds.to(precision)
 
-        # T5 encoding for text embeddings
-        text_inputs_2 = self.tokenizer_2(
-            conditioning,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            return_tensors="pt",
-        )
+            # Create pooled representation via mean pooling
+            # prompt_embeds shape: [B, seq_len, hidden_dim]
+            # We mean-pool over sequence length to get [B, hidden_dim]
+            pooled_prompt_embeds = prompt_embeds.mean(dim=1)
 
-        with torch.no_grad():
-            text_input_ids_2 = text_inputs_2.input_ids.to(self.text_encoder_2.device)
-            prompt_embeds_2 = self.text_encoder_2(
-                text_input_ids_2,
-                output_hidden_states=False,
-            )[0].to(precision)
+            # Project to expected pooled dimension if needed
+            # The transformer's time_text_embed expects pooled_projection_dim
+            if pooled_prompt_embeds.shape[-1] != self._pooled_projection_dim:
+                # Create a simple linear projection (lazy initialization)
+                if not hasattr(self, "_pooled_proj"):
+                    self._pooled_proj = torch.nn.Linear(
+                        pooled_prompt_embeds.shape[-1],
+                        self._pooled_projection_dim,
+                        bias=False,
+                    ).to(pooled_prompt_embeds.device, pooled_prompt_embeds.dtype)
+                    # Initialize with identity-like projection
+                    torch.nn.init.eye_(self._pooled_proj.weight[:, : pooled_prompt_embeds.shape[-1]])
+                pooled_prompt_embeds = self._pooled_proj(pooled_prompt_embeds)
 
-        return pooled_prompt_embeds, prompt_embeds_2
+        return pooled_prompt_embeds, prompt_embeds
 
     def to(self, *args, **kwargs):
         """Moves the model to the specified device."""
         self.text_encoder.to(*args, **kwargs)
-        self.text_encoder_2.to(*args, **kwargs)
+        if hasattr(self, "_pooled_proj"):
+            self._pooled_proj.to(*args, **kwargs)
         return self
 
 
 class Flux2KleinImageEncoder:
     """VAE encoder/decoder for Flux2-Klein.
 
-    Flux2-Klein uses 128 latent channels (vs 16 in FLUX.1-dev).
+    Flux2-Klein uses AutoencoderKLFlux2 with 128 latent channels.
     """
 
     def __init__(self, model_id: str):
-        self.vae: AutoencoderKL = AutoencoderKL.from_pretrained(
+        self.vae: AutoencoderKLFlux2 = AutoencoderKLFlux2.from_pretrained(
             model_id,
-            cache_dir=os.environ["HF_HOME"],
+            cache_dir=os.environ.get("HF_HOME"),
             subfolder="vae",
             local_files_only=str2bool(os.getenv("LOCAL_FILES_ONLY", "false")),
         )
