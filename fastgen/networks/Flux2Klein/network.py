@@ -237,7 +237,6 @@ def classify_forward_flux2(
     self,
     hidden_states: torch.Tensor,
     encoder_hidden_states: torch.Tensor = None,
-    pooled_projections: torch.Tensor = None,
     timestep: torch.LongTensor = None,
     img_ids: torch.Tensor = None,
     txt_ids: torch.Tensor = None,
@@ -251,16 +250,15 @@ def classify_forward_flux2(
     Modified forward pass for Flux2Transformer2DModel with feature extraction support.
 
     Note: Flux2-Klein has patch_size=1, so hidden_states shape is [B, H*W, C]
-    where C=128 (latent channels).
+    where C=128 (latent channels after patchification).
 
     Args:
         hidden_states: Input latent states [B, H*W, C].
-        encoder_hidden_states: T5 text encoder hidden states.
-        pooled_projections: CLIP pooled text embeddings.
-        timestep: Current timestep.
-        img_ids: Image position IDs.
-        txt_ids: Text position IDs.
-        guidance: Guidance scale (unused for Flux2-Klein, kept for API compatibility).
+        encoder_hidden_states: Qwen3 text encoder hidden states.
+        timestep: Current timestep (in [0, 1] range).
+        img_ids: Image position IDs [B, H*W, 4] or [H*W, 4].
+        txt_ids: Text position IDs [B, seq_len, 4] or [seq_len, 4].
+        guidance: Optional guidance scale for CFG.
         joint_attention_kwargs: Additional attention kwargs.
         return_features_early: If True, return features as soon as collected.
         feature_indices: Set of block indices to extract features from.
@@ -277,42 +275,63 @@ def classify_forward_flux2(
 
     idx, features = 0, []
 
-    # Store original sequence length to compute spatial dims for feature reshaping
-    # hidden_states: [B, H*W, C] where H*W is the sequence length
-    seq_len = hidden_states.shape[1]
-    spatial_size = int(seq_len**0.5)  # Assuming square spatial dimensions
+    # Store text sequence length for later separation
+    num_txt_tokens = encoder_hidden_states.shape[1]
 
-    # 1. Patch embedding (no packing for Flux2-Klein)
-    hidden_states = self.x_embedder(hidden_states)
+    # Store image sequence length for feature reshaping
+    img_seq_len = hidden_states.shape[1]
+    spatial_size = int(img_seq_len**0.5)  # Assuming square spatial dimensions
 
-    # 2. Time embedding (no guidance embedding for Flux2-Klein)
+    # 1. Calculate timestep embedding and modulation parameters
     timestep_scaled = timestep.to(hidden_states.dtype) * 1000
-    temb = self.time_text_embed(timestep_scaled, pooled_projections)
+    if guidance is not None:
+        guidance_scaled = guidance.to(hidden_states.dtype) * 1000
+    else:
+        guidance_scaled = None
 
-    # 3. Text embedding
+    temb = self.time_guidance_embed(timestep_scaled, guidance_scaled)
+
+    # Get modulation parameters for double and single stream blocks
+    double_stream_mod_img = self.double_stream_modulation_img(temb)
+    double_stream_mod_txt = self.double_stream_modulation_txt(temb)
+    single_stream_mod = self.single_stream_modulation(temb)[0]
+
+    # 2. Input projection for image and text
+    hidden_states = self.x_embedder(hidden_states)
     encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
-    # 4. Prepare positional embeddings
-    ids = torch.cat((txt_ids, img_ids), dim=0)
-    image_rotary_emb = self.pos_embed(ids)
+    # 3. Calculate RoPE embeddings from image and text position IDs
+    if img_ids.ndim == 3:
+        img_ids = img_ids[0]
+    if txt_ids.ndim == 3:
+        txt_ids = txt_ids[0]
 
-    # 5. Joint transformer blocks (5 blocks for Flux2-Klein)
+    image_rotary_emb = self.pos_embed(img_ids)
+    text_rotary_emb = self.pos_embed(txt_ids)
+    concat_rotary_emb = (
+        torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+        torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+    )
+
+    # 4. Double Stream Transformer Blocks (5 for Flux2-Klein)
     for block in self.transformer_blocks:
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                 block,
                 hidden_states,
                 encoder_hidden_states,
-                temb,
-                image_rotary_emb,
+                double_stream_mod_img,
+                double_stream_mod_txt,
+                concat_rotary_emb,
                 joint_attention_kwargs,
             )
         else:
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                temb_mod_params_img=double_stream_mod_img,
+                temb_mod_params_txt=double_stream_mod_txt,
+                image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
@@ -330,30 +349,34 @@ def classify_forward_flux2(
 
         idx += 1
 
-    # 6. Single transformer blocks (20 blocks for Flux2-Klein)
+    # Concatenate text and image streams for single-block processing
+    hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+    # 5. Single Stream Transformer Blocks (20 for Flux2-Klein)
     for block in self.single_transformer_blocks:
         if torch.is_grad_enabled() and self.gradient_checkpointing:
-            encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
+            hidden_states = self._gradient_checkpointing_func(
                 block,
                 hidden_states,
-                encoder_hidden_states,
-                temb,
-                image_rotary_emb,
+                None,
+                single_stream_mod,
+                concat_rotary_emb,
                 joint_attention_kwargs,
             )
         else:
-            encoder_hidden_states, hidden_states = block(
+            hidden_states = block(
                 hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                image_rotary_emb=image_rotary_emb,
+                encoder_hidden_states=None,
+                temb_mod_params=single_stream_mod,
+                image_rotary_emb=concat_rotary_emb,
                 joint_attention_kwargs=joint_attention_kwargs,
             )
 
         # Check if we should extract features at this index
         if idx in feature_indices:
-            # Reshape from [B, seq_len, hidden_dim] to [B, hidden_dim, H, W] for discriminator
-            feat = hidden_states.clone()
+            # Extract only image features (remove text tokens)
+            img_hidden = hidden_states[:, num_txt_tokens:, ...]
+            feat = img_hidden.clone()
             B, S, C = feat.shape
             feat = feat.permute(0, 2, 1).reshape(B, C, spatial_size, spatial_size)
             features.append(feat)
@@ -364,7 +387,10 @@ def classify_forward_flux2(
 
         idx += 1
 
-    # 7. Final projection
+    # Remove text tokens from concatenated stream
+    hidden_states = hidden_states[:, num_txt_tokens:, ...]
+
+    # 6. Output layers
     hidden_states = self.norm_out(hidden_states, temb)
     output = self.proj_out(hidden_states)
 
@@ -568,9 +594,13 @@ class Flux2Klein(FastGenNetwork):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Prepare image position IDs for the transformer.
+        """Prepare image position IDs for Flux2 transformer.
 
-        Note: Flux2-Klein has patch_size=1, so no packing is applied.
+        Flux2 uses 4D position coordinates (T, H, W, L):
+        - T: Time dimension (0 for latents)
+        - H: Height coordinate
+        - W: Width coordinate
+        - L: Layer dimension (0 for latents)
 
         Args:
             height: Latent height.
@@ -579,13 +609,16 @@ class Flux2Klein(FastGenNetwork):
             dtype: Target dtype.
 
         Returns:
-            torch.Tensor: Image position IDs [H*W, 3] (2D, no batch dim).
+            torch.Tensor: Image position IDs [H*W, 4].
         """
-        latent_image_ids = torch.zeros(height, width, 3, device=device, dtype=dtype)
-        latent_image_ids[..., 1] = torch.arange(height, device=device, dtype=dtype)[:, None]
-        latent_image_ids[..., 2] = torch.arange(width, device=device, dtype=dtype)[None, :]
-        latent_image_ids = latent_image_ids.reshape(height * width, 3)
-        return latent_image_ids
+        t = torch.arange(1, device=device, dtype=dtype)  # [0]
+        h = torch.arange(height, device=device, dtype=dtype)
+        w = torch.arange(width, device=device, dtype=dtype)
+        l = torch.arange(1, device=device, dtype=dtype)  # [0]
+
+        # Create position IDs: (H*W, 4) via cartesian product
+        latent_ids = torch.cartesian_prod(t, h, w, l)
+        return latent_ids
 
     def _prepare_text_ids(
         self,
@@ -593,7 +626,9 @@ class Flux2Klein(FastGenNetwork):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Prepare text position IDs.
+        """Prepare text position IDs for Flux2 transformer.
+
+        Text tokens use 4D coordinates with T=-1 to distinguish from image tokens.
 
         Args:
             seq_length: Text sequence length.
@@ -601,9 +636,12 @@ class Flux2Klein(FastGenNetwork):
             dtype: Target dtype.
 
         Returns:
-            torch.Tensor: Text position IDs [seq_length, 3] (2D, no batch dim).
+            torch.Tensor: Text position IDs [seq_length, 4].
         """
-        text_ids = torch.zeros(seq_length, 3, device=device, dtype=dtype)
+        # Text tokens: T=-1, H=sequence_position, W=0, L=0
+        text_ids = torch.zeros(seq_length, 4, device=device, dtype=dtype)
+        text_ids[:, 0] = -1  # T = -1 for text
+        text_ids[:, 1] = torch.arange(seq_length, device=device, dtype=dtype)  # H = seq position
         return text_ids
 
     def _flatten_latents(self, latents: torch.Tensor) -> torch.Tensor:
@@ -681,9 +719,11 @@ class Flux2Klein(FastGenNetwork):
         height, width = x_t.shape[2], x_t.shape[3]
 
         # Unpack condition: (pooled_prompt_embeds, prompt_embeds)
-        pooled_prompt_embeds, prompt_embeds = condition
+        # Note: pooled_prompt_embeds is created by mean pooling but not used by Flux2
+        # We keep it for API compatibility but don't pass to transformer
+        _pooled_prompt_embeds, prompt_embeds = condition
 
-        # Prepare position IDs (2D tensors, no batch dimension)
+        # Prepare position IDs for Flux2 (4D: T, H, W, L)
         img_ids = self._prepare_latent_image_ids(height, width, x_t.device, x_t.dtype)
         txt_ids = self._prepare_text_ids(prompt_embeds.shape[1], x_t.device, x_t.dtype)
 
@@ -693,11 +733,10 @@ class Flux2Klein(FastGenNetwork):
         model_outputs = self.transformer(
             hidden_states=hidden_states,
             encoder_hidden_states=prompt_embeds,
-            pooled_projections=pooled_prompt_embeds,
             timestep=t,  # Flux expects timestep in [0, 1]
             img_ids=img_ids,
             txt_ids=txt_ids,
-            guidance=None,  # Flux2-Klein doesn't use embedded guidance
+            guidance=guidance,  # Pass guidance if provided
             return_features_early=return_features_early,
             feature_indices=feature_indices,
             return_logvar=return_logvar,
