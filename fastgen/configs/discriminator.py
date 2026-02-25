@@ -104,3 +104,10 @@ Discriminator_CosmosPredict2_14B_Config: DictConfig = L(Discriminator_VideoDiT)(
     disc_type="dit_simple_conv3d",
     inner_dim=5120,  # Must match model's inner_dim for Cosmos
 )
+
+# Flux2-Klein-4B: hidden_dim=3072, 5 joint blocks + 20 single blocks = 25 total
+Discriminator_Flux2Klein_Config: DictConfig = L(Discriminator_ImageDiT)(
+    feature_indices=None,
+    num_blocks=25,  # 5 joint + 20 single blocks
+    inner_dim=3072,  # Flux hidden dimension (24 heads * 128 dim)
+)

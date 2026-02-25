@@ -9,6 +9,10 @@ from fastgen.datasets.wds_dataloaders import (
     ImageWDSLoader,
     VideoWDSLoader,
 )
+from fastgen.datasets.editing_dataloader import (
+    EditingWDSLoader,
+    EditingLatentWDSLoader,
+)
 
 from fastgen.utils import LazyCall as L
 
@@ -56,6 +60,32 @@ VideoLatentLoaderConfig = L(WDSLoader)(
     num_workers=2,
     # NOTE: For v2v tasks, add condition latent (e.g., depth) to key_map:
     #   key_map={"real": "latent.pth", "condition": "txt_emb.pth", "depth_latent": "depth_latent.pth"}
+)
+
+# ################################################################################
+# Editing Loaders (for image-to-image editing distillation)
+# ################################################################################
+# See fastgen/datasets/editing_dataloader.py for more details.
+
+# For raw image editing triplets: (source_image, target_image, instruction)
+# WebDataset format: {key}.source.jpg, {key}.target.jpg, {key}.instruction.txt
+EditingLoaderConfig = L(EditingWDSLoader)(
+    datatags=["WDS:/path/to/editing_data"],
+    batch_size=2,
+    input_res=1024,
+    source_key="source.jpg",
+    target_key="target.jpg",
+    instruction_key="instruction.txt",
+)
+
+# For pre-encoded editing triplets (latent space)
+# WebDataset format: {key}.source_latent.pth, {key}.target_latent.pth, {key}.instruction.txt
+EditingLatentLoaderConfig = L(EditingLatentWDSLoader)(
+    datatags=["WDS:/path/to/editing_latents"],
+    batch_size=2,
+    source_key="source_latent.pth",
+    target_key="target_latent.pth",
+    instruction_key="instruction.txt",
 )
 
 # ################################################################################

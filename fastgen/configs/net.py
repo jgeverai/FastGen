@@ -11,6 +11,7 @@ from fastgen.networks.DiT.network import DiT
 from fastgen.networks.SD15.network import StableDiffusion15
 from fastgen.networks.SDXL.network import StableDiffusionXL
 from fastgen.networks.Flux.network import Flux
+from fastgen.networks.Flux2Klein.network import Flux2Klein
 from fastgen.networks.CogVideoX.network import CogVideoX
 from fastgen.networks.Wan.network import Wan
 from fastgen.networks.Wan.network_causal import CausalWan
@@ -131,6 +132,14 @@ SD15Config: DictConfig = L(StableDiffusion15)()
 SDXLConfig: DictConfig = L(StableDiffusionXL)()
 
 FluxConfig: DictConfig = L(Flux)()
+
+# ------ Flux2-Klein models ------
+# Flux2-Klein-4B: 4B parameter model optimized for fast inference
+# 5 joint blocks + 20 single blocks = 25 total, 128 latent channels
+Flux2KleinConfig: DictConfig = L(Flux2Klein)()  # Distilled 4-step model
+Flux2KleinBaseConfig: DictConfig = L(Flux2Klein)(
+    model_id="black-forest-labs/FLUX.2-klein-base-4B",  # Base 50-step model
+)
 
 CogVideoXConfig: DictConfig = L(CogVideoX)(
     model_id_or_local_path="THUDM/CogVideoX-2b",
